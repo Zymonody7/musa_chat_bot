@@ -1,0 +1,5 @@
+{
+  "name": "MusaChat",
+  "description": "A sophisticated chatbot interface with simulated authentication and a visual shared memory system that influences the AI's personality and knowledge base.",
+  "requestFramePermissions": []
+}
