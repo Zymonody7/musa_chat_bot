@@ -1,0 +1,32 @@
+# 离线 PDF RAG 推理系统依赖
+
+# PDF 处理（二选一）
+pymupdf>=0.24.0
+# pdfplumber>=0.10.0  # 可选替代方案
+
+# 向量检索
+faiss-cpu>=1.7.4
+# faiss-gpu>=1.7.4  # GPU 版本（可选，替换 faiss-cpu）
+
+# 深度学习框架
+torch>=2.0.0
+transformers>=4.35.0
+
+# Embedding 模型（推荐）
+sentence-transformers>=2.2.0
+
+# Web 服务
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# 工具库
+numpy>=1.24.0
+
+# 模型下载
+modelscope>=1.11.0
+
+# OCR（图片型 PDF 回退）
+pytesseract>=0.3.10
+Pillow>=10.0.0
+
+

@@ -26,11 +26,57 @@ class EmbeddingModel:
         """
         Args:
             model_path: 本地模型路径
-            device: 'musa', 'cuda' 或 'cpu'，None 时默认使用 musa
+            device: 可选 'cuda' / 'mps' / 'musa' / 'cpu'。
+                    None 时根据可用性自动选择。
         """
         self.model_path = model_path
-        self.device = device or "musa"  # 默认使用 musa GPU
+        self.device = self._select_device(device)
         self._load_model()
+
+    def _select_device(self, preferred: Optional[str] = None) -> str:
+        """根据可用性选择设备。
+        优先级（若未指定preferred）：CUDA > MUSA > MPS > CPU
+        若指定 preferred，但不可用，则按上述顺序回退。
+        """
+        # 安全检测函数
+        def has_musa() -> bool:
+            try:
+                import torch_musa  # type: ignore
+                return hasattr(torch_musa, "is_available") and torch_musa.is_available()
+            except Exception:
+                return False
+
+        def has_mps() -> bool:
+            return hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+
+        def normalize(dev: Optional[str]) -> Optional[str]:
+            if dev is None:
+                return None
+            dev = dev.lower()
+            if dev in {"cuda", "mps", "musa", "cpu"}:
+                return dev
+            return None
+
+        preferred = normalize(preferred)
+
+        # 如果用户指定了设备，且可用则返回，否则回退
+        if preferred == "cuda" and torch.cuda.is_available():
+            return "cuda"
+        if preferred == "musa" and has_musa():
+            return "musa"
+        if preferred == "mps" and has_mps():
+            return "mps"
+        if preferred == "cpu":
+            return "cpu"
+
+        # 自动选择
+        if torch.cuda.is_available():
+            return "cuda"
+        if has_musa():
+            return "musa"
+        if has_mps():
+            return "mps"
+        return "cpu"
     
     def _load_model(self):
         """加载 embedding 模型"""
@@ -84,9 +130,15 @@ class EmbeddingModel:
                     self.model_path,
                     trust_remote_code=True,
                     local_files_only=True,
-                    device_map=self.device,
                     use_safetensors=has_safetensors
                 )
+                # 将模型移动到目标设备
+                try:
+                    self.model.to(self.device)
+                except Exception as move_err:
+                    logger.warning(f"模型迁移到设备 {self.device} 失败，改用 CPU: {move_err}")
+                    self.device = "cpu"
+                    self.model.to(self.device)
                 
                 # 恢复原始函数
                 if not has_safetensors and original_check:
@@ -151,11 +203,13 @@ class RAGIndex:
         Args:
             embedding_model_path: Embedding 模型路径
             index_dir: 索引存储目录
-            device: 设备
+            device: 指定设备（'cuda'/'mps'/'musa'/'cpu'），None 自动检测
         """
         self.embedding_model_path = embedding_model_path
         self.index_dir = Path(index_dir)
         self.index_dir.mkdir(parents=True, exist_ok=True)
+        # 保存用户指定设备（供延迟加载时使用）
+        self._device = device
         
         self.embedding_model = None
         self.index = None
@@ -168,10 +222,10 @@ class RAGIndex:
     def _get_embedding_model(self) -> EmbeddingModel:
         """延迟加载 embedding 模型"""
         if self.embedding_model is None:
-            # 使用 musa GPU 加速 embedding
+            # 自动选择可用设备（也支持显式传入）
             self.embedding_model = EmbeddingModel(
                 self.embedding_model_path,
-                device="musa"
+                device=getattr(self, "_device", None)
             )
         return self.embedding_model
     
@@ -250,13 +304,14 @@ class RAGIndex:
         
         logger.info(f"索引加载完成，共 {self.index.ntotal} 个向量，{len(self.chunks)} 个 chunks")
     
-    def search(self, query: str, top_k: int = 8) -> List[Tuple[Dict, float]]:
+    def search(self, query: str, top_k: int = 8, doc_id: Optional[str] = None) -> List[Tuple[Dict, float]]:
         """
         搜索相关 chunks
         
         Args:
             query: 查询文本
             top_k: 返回 top k 结果
+            doc_id: 指定只检索某个 PDF（文件名），None 时跨全部索引检索
         
         Returns:
             List[Tuple[Dict, float]]: (chunk, score) 列表
@@ -268,13 +323,22 @@ class RAGIndex:
         embedding_model = self._get_embedding_model()
         query_embedding = embedding_model.encode([query])
         
+        # 如果指定了 doc_id，搜索更多候选以确保过滤后有足够结果
+        search_k = top_k if doc_id is None else top_k * 3
+        
         # 搜索
-        scores, indices = self.index.search(query_embedding.astype('float32'), top_k)
+        scores, indices = self.index.search(query_embedding.astype('float32'), search_k)
         
         results = []
         for score, idx in zip(scores[0], indices[0]):
             if idx < len(self.chunks):
-                results.append((self.chunks[idx], float(score)))
+                ch = self.chunks[idx]
+                if doc_id is not None and ch["meta"].get("doc_id") != doc_id:
+                    continue
+                results.append((ch, float(score)))
+                # 达到目标 top_k 数量后就停止
+                if len(results) >= top_k:
+                    break
         
         return results
     
@@ -297,12 +361,14 @@ class RAGIndex:
         page_groups = {}
         for chunk, score in search_results:
             pdf_page = chunk["meta"]["pdf_page"]
+            doc_id = chunk["meta"].get("doc_id")
             if pdf_page not in page_groups:
                 page_groups[pdf_page] = {
                     "chunks": [],
                     "scores": [],
                     "chapter": chunk["meta"].get("chapter"),
                     "section": chunk["meta"].get("section"),
+                    "doc_id": doc_id,
                 }
             page_groups[pdf_page]["chunks"].append(chunk["text"])
             page_groups[pdf_page]["scores"].append(score)
@@ -328,6 +394,7 @@ class RAGIndex:
                 "section": group["section"],
                 "snippet": snippet,
                 "score": float(np.mean(group["scores"])),
+                "doc_id": group.get("doc_id"),
             })
         
         # 确保至少返回 2 个 sources（如果搜索结果足够）
@@ -345,6 +412,7 @@ class RAGIndex:
                     "section": group["section"],
                     "snippet": snippet,
                     "score": float(np.mean(group["scores"])),
+                    "doc_id": group.get("doc_id"),
                 })
         
         return sources

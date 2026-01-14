@@ -35,6 +35,7 @@ class Chunker:
         pdf_page = page_data["pdf_page"]
         chapter = page_data.get("chapter")
         section = page_data.get("section")
+        doc_id = page_data.get("doc_id")
         
         chunks = []
         
@@ -46,6 +47,7 @@ class Chunker:
                     "pdf_page": pdf_page,
                     "chapter": chapter,
                     "section": section,
+                    "doc_id": doc_id,
                     "chunk_idx": 0,
                 }
             })
@@ -76,6 +78,7 @@ class Chunker:
                     "pdf_page": pdf_page,
                     "chapter": chapter,
                     "section": section,
+                    "doc_id": doc_id,
                     "chunk_idx": chunk_idx,
                 }
             })

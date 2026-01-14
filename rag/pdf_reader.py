@@ -1,7 +1,8 @@
-"""PDF 文本提取模块"""
+"""PDF 文本提取模块（支持图片型 PDF 的 OCR 回退）"""
 import re
 import logging
 from typing import List, Dict, Optional, Tuple
+import os
 try:
     import fitz  # PyMuPDF
     HAS_PYMUPDF = True
@@ -14,6 +15,14 @@ except ImportError:
         HAS_PDFPLUMBER = False
 
 logger = logging.getLogger(__name__)
+
+# 可选 OCR 依赖
+try:
+    import pytesseract
+    from PIL import Image
+    HAS_TESSERACT = True
+except Exception:
+    HAS_TESSERACT = False
 
 
 class PDFReader:
@@ -28,6 +37,8 @@ class PDFReader:
         self.pdf_path = pdf_path
         self.min_page_chars = min_page_chars
         self._check_dependencies()
+        # 文档 ID（用于区分不同 PDF）
+        self.doc_id = os.path.basename(self.pdf_path)
     
     def _check_dependencies(self):
         """检查 PDF 处理库"""
@@ -40,6 +51,21 @@ class PDFReader:
     def _extract_text_pymupdf(self, page) -> str:
         """使用 PyMuPDF 提取文本"""
         return page.get_text()
+
+    def _extract_ocr_pymupdf(self, page) -> str:
+        """基于 PyMuPDF 渲染并使用 Tesseract OCR 提取文本（若可用）"""
+        if not HAS_TESSERACT:
+            return ""
+        try:
+            # 渲染为像素图（提高分辨率以提升 OCR 效果）
+            zoom = 2.0
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            text = pytesseract.image_to_string(img)
+            return text.strip()
+        except Exception:
+            return ""
     
     def _extract_text_pdfplumber(self, page) -> str:
         """使用 pdfplumber 提取文本"""
@@ -105,6 +131,11 @@ class PDFReader:
         for page_num in range(total_pages):
             page = doc[page_num]
             text = extract_func(page).strip()
+            # 若文本过短，尝试 OCR（仅在 PyMuPDF 可用时）
+            if len(text) < self.min_page_chars and HAS_PYMUPDF:
+                ocr_text = self._extract_ocr_pymupdf(page)
+                if len(ocr_text) >= self.min_page_chars:
+                    text = ocr_text
             
             # 跳过极短页
             if len(text) < self.min_page_chars:
@@ -127,6 +158,7 @@ class PDFReader:
                 "pdf_page": page_num + 1,  # 从 1 开始
                 "chapter": current_chapter,
                 "section": current_section,
+                "doc_id": self.doc_id,
             })
             
             logger.debug(

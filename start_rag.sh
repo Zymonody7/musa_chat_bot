@@ -2,7 +2,7 @@
 # 离线 PDF RAG 推理系统启动脚本
 
 # 配置路径（可根据实际情况修改）
-LLM_MODEL_PATH="/root/autodl-tmp/local-model"
+LLM_MODEL_PATH="./models/llm_model"
 EMBEDDING_MODEL_PATH="${EMBEDDING_MODEL_PATH:-./models/embedding_model}"
 PDF_PATH="${PDF_PATH:-./rag/statics/PMPP-3rd-Edition.pdf}"
 INDEX_DIR="${INDEX_DIR:-./rag_store}"

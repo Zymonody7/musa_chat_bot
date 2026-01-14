@@ -16,12 +16,12 @@ logger = logging.getLogger(__name__)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="构建 PDF RAG 索引")
+    parser = argparse.ArgumentParser(description="构建 PDF RAG 索引（支持目录内多 PDF）")
     parser.add_argument(
-        "--pdf",
+        "--pdf_dir",
         type=str,
-        default="./data/book.pdf",
-        help="PDF 文件路径"
+        default="./rag/statics",
+        help="包含多个 PDF 的目录（默认 rag/statics）"
     )
     parser.add_argument(
         "--embedding-model",
@@ -62,9 +62,9 @@ def main():
     
     args = parser.parse_args()
     
-    # 检查输入文件
-    if not os.path.exists(args.pdf):
-        raise FileNotFoundError(f"PDF 文件不存在: {args.pdf}")
+    # 检查输入目录
+    if not os.path.isdir(args.pdf_dir):
+        raise FileNotFoundError(f"PDF 目录不存在: {args.pdf_dir}")
     
     if not os.path.exists(args.embedding_model):
         raise FileNotFoundError(f"Embedding 模型不存在: {args.embedding_model}")
@@ -72,16 +72,27 @@ def main():
     logger.info("=" * 60)
     logger.info("开始构建 RAG 索引")
     logger.info("=" * 60)
-    logger.info(f"PDF 文件: {args.pdf}")
+    logger.info(f"PDF 目录: {args.pdf_dir}")
     logger.info(f"Embedding 模型: {args.embedding_model}")
     logger.info(f"索引输出目录: {args.index_dir}")
     logger.info(f"Chunk 大小: {args.chunk_size}, 重叠: {args.overlap}")
     
-    # 1. 提取 PDF 文本
-    logger.info("\n[1/3] 提取 PDF 文本...")
-    pdf_reader = PDFReader(args.pdf, min_page_chars=args.min_page_chars)
-    pages_data = pdf_reader.extract_pages()
-    logger.info(f"提取了 {len(pages_data)} 页文本")
+    # 1. 提取目录内所有 PDF 文本
+    logger.info("\n[1/3] 提取 PDF 文本（遍历目录）...")
+    pages_data = []
+    pdf_files = [
+        os.path.join(args.pdf_dir, f)
+        for f in os.listdir(args.pdf_dir)
+        if f.lower().endswith('.pdf')
+    ]
+    if not pdf_files:
+        raise FileNotFoundError("目录中未找到 PDF 文件")
+    for pdf_path in pdf_files:
+        logger.info(f"读取: {pdf_path}")
+        reader = PDFReader(pdf_path, min_page_chars=args.min_page_chars)
+        pages = reader.extract_pages()
+        pages_data.extend(pages)
+    logger.info(f"共提取 {len(pages_data)} 页文本（来自 {len(pdf_files)} 个 PDF）")
     
     # 2. 切分 chunks
     logger.info("\n[2/3] 切分文本为 chunks...")

@@ -15,7 +15,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import torch
-import torch_musa  # noqa: F401
+try: 
+  import torch_musa  # noqa: F401
+except ImportError:
+  pass
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import TextIteratorStreamer
 from threading import Thread
@@ -26,7 +29,7 @@ from collections import defaultdict
 from rag.index import RAGIndex
 from rag.prompts import build_prompt
 
-# 配置日志m
+# 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -37,7 +40,7 @@ logger = logging.getLogger(__name__)
 rag_index: Optional[RAGIndex] = None
 llm_tokenizer: Optional[AutoTokenizer] = None
 llm_model: Optional[AutoModelForCausalLM] = None
-device: str = "musa"  # 设备类型
+device: str = "cpu"  # 设备类型（启动时自动选择）
 session_history: Dict[str, List[str]] = defaultdict(list)  # 每个session的最近3次问题的关键词
 sessions: Dict[str, List[Dict]] = defaultdict(list)  # 每个session的对话记录
 
@@ -45,6 +48,7 @@ sessions: Dict[str, List[Dict]] = defaultdict(list)  # 每个session的对话记
 class AskRequest(BaseModel):
     question: str
     session_id: Optional[str] = None  # 会话ID，如果为空则创建新会话
+    doc_id: Optional[str] = None  # 指定检索的 PDF（文件名），为空则跨全部检索
 
 
 class AskResponse(BaseModel):
@@ -82,19 +86,36 @@ async def lifespan(app: FastAPI):
     
     # 从环境变量获取配置
     embedding_model_path = os.getenv("EMBEDDING_MODEL_PATH", "./models/embedding_model")
-    llm_model_path = os.getenv("LLM_MODEL_PATH", "/root/autodl-tmp/local-model")
+    llm_model_path = os.getenv("LLM_MODEL_PATH", "./models/llm_model")
     index_dir = os.getenv("INDEX_DIR", "./rag_store")
     
-    # 使用 musa GPU
-    device = "musa"
-    logger.info(f"使用设备: {device} (musa GPU)")
+    # 自动选择设备：CUDA > MUSA > CPU
+    def has_musa() -> bool:
+        try:
+            import torch_musa  # type: ignore
+            return hasattr(torch_musa, "is_available") and torch_musa.is_available()
+        except Exception:
+            return False
+
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif has_musa():
+        device = "musa"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        # MPS 在某些模型上生成时会卡死，改用 CPU
+        logger.warning("MPS 检测到但存在生成卡死问题，改用 CPU")
+        device = "cpu"
+    else:
+        device = "cpu"
+    logger.info(f"使用设备: {device}")
     
     # 加载 RAG 索引
     logger.info("加载 RAG 索引...")
     try:
         rag_index = RAGIndex(
             embedding_model_path=embedding_model_path,
-            index_dir=index_dir
+            index_dir=index_dir,
+            device=device,
         )
         rag_index.load_index()
         logger.info("RAG 索引加载完成")
@@ -104,19 +125,30 @@ async def lifespan(app: FastAPI):
     
     # 加载 LLM 模型
     logger.info(f"加载 LLM 模型: {llm_model_path}...")
-    logger.info(f"使用 musa GPU 加速")
+    logger.info(f"推理设备: {device}")
     try:
         llm_tokenizer = AutoTokenizer.from_pretrained(
             llm_model_path,
             trust_remote_code=True,
             local_files_only=True
         )
-        # 使用 musa GPU 加载配置（优化：不使用 device_map，手动移动）
+        # 确保 eos/pad token 存在，避免生成无法停止
+        if llm_tokenizer.eos_token_id is None:
+            try:
+                eos = llm_tokenizer.convert_tokens_to_ids("</s>")
+                llm_tokenizer.eos_token_id = eos if eos is not None else llm_tokenizer.pad_token_id
+            except Exception:
+                llm_tokenizer.eos_token_id = llm_tokenizer.pad_token_id
+        if llm_tokenizer.pad_token_id is None:
+            llm_tokenizer.pad_token_id = llm_tokenizer.eos_token_id
+        # 加载配置（不使用 device_map，手动移动）
+        dtype = torch.float16 if device in ("cuda", "musa") else torch.float32
+        attn_impl = "eager" if device == "musa" else None
         load_kwargs = {
             "trust_remote_code": True,
             "local_files_only": True,
-            "torch_dtype": torch.float16,
-            "attn_implementation": "eager",  # musa 设备必需
+            "dtype": dtype,  # 使用 dtype 代替已弃用的 torch_dtype
+            "attn_implementation": attn_impl,
             "device_map": None,  # 不使用 device_map，手动移动更快
         }
         
@@ -125,23 +157,33 @@ async def lifespan(app: FastAPI):
             **load_kwargs
         )
         
-        # 手动移动到 musa 设备
-        if hasattr(torch, 'musa') and torch.musa.is_available():
-            torch.musa.set_device(0)
-            llm_model = llm_model.to("musa", non_blocking=True)  # 使用 non_blocking
-            logger.info("模型已移动到 musa 设备")
+        # 手动移动到目标设备
+        try:
+            if device == "cuda" and torch.cuda.is_available():
+                torch.cuda.set_device(0)
+                llm_model = llm_model.to("cuda", non_blocking=True)
+                logger.info("模型已移动到 CUDA 设备")
+            elif device == "musa" and has_musa():
+                try:
+                    import torch_musa  # type: ignore
+                    if hasattr(torch_musa, "set_device"):
+                        torch_musa.set_device(0)
+                except Exception:
+                    pass
+                llm_model = llm_model.to("musa", non_blocking=True)
+                logger.info("模型已移动到 MUSA 设备")
+            else:
+                llm_model = llm_model.to("cpu")
+                logger.info("模型使用 CPU 设备")
+        except Exception as move_err:
+            logger.warning(f"模型移动到设备 {device} 失败，改用 CPU: {move_err}")
+            llm_model = llm_model.to("cpu")
         
         llm_model.eval()
         logger.info("LLM 模型加载完成")
         
         # 可选：torch.compile 加速推理（参考 serve.py）
-        try:
-            if hasattr(torch, "compile") and device != "cpu":
-                logger.info("正在编译模型以加速推理...")
-                llm_model = torch.compile(llm_model, mode="reduce-overhead", fullgraph=False)
-                logger.info("✓ 模型编译完成")
-        except Exception as e:
-            logger.warning(f"torch.compile 失败，继续使用未编译模型: {e}")
+        # 关闭 torch.compile，避免编译失败导致推理阻塞
         
         # 预热模型（参考 serve.py）
         logger.info("正在预热模型...")
@@ -201,6 +243,66 @@ app.add_middleware(
 async def health():
     """健康检查"""
     return {"status": "ok"}
+
+
+@app.get("/indexed-docs")
+async def list_docs():
+    """列出已索引的 PDF 文档（doc_id 列表）"""
+    global rag_index
+    if rag_index is None:
+        raise HTTPException(status_code=500, detail="索引未加载")
+    try:
+        doc_set = {}
+        chunks_without_doc_id = 0
+        for ch in rag_index.chunks:
+            did = ch["meta"].get("doc_id")
+            if not did:
+                chunks_without_doc_id += 1
+                continue
+            info = doc_set.get(did) or {"doc_id": did, "pages": set(), "chunks": 0}
+            info["pages"].add(ch["meta"].get("pdf_page"))
+            info["chunks"] += 1
+            doc_set[did] = info
+        docs = [
+            {"doc_id": d["doc_id"], "page_count": len(d["pages"]), "chunk_count": d["chunks"]}
+            for d in doc_set.values()
+        ]
+        docs.sort(key=lambda x: x["doc_id"])  # 稳定排序
+        logger.info(f"列出文档: {len(docs)} 个 PDF, chunks_without_doc_id={chunks_without_doc_id}, total_chunks={len(rag_index.chunks)}, doc_ids={[d['doc_id'] for d in docs]}")
+        return {"docs": docs}
+    except Exception as e:
+        logger.error(f"列出文档失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="内部错误")
+
+
+@app.get("/docs")
+async def list_docs_compat():
+    """列出已索引的 PDF 文档（doc_id 列表）- 兼容旧接口"""
+    global rag_index
+    if rag_index is None:
+        raise HTTPException(status_code=500, detail="索引未加载")
+    try:
+        doc_set = {}
+        chunks_without_doc_id = 0
+        for ch in rag_index.chunks:
+            did = ch["meta"].get("doc_id")
+            if not did:
+                chunks_without_doc_id += 1
+                continue
+            info = doc_set.get(did) or {"doc_id": did, "pages": set(), "chunks": 0}
+            info["pages"].add(ch["meta"].get("pdf_page"))
+            info["chunks"] += 1
+            doc_set[did] = info
+        docs = [
+            {"doc_id": d["doc_id"], "page_count": len(d["pages"]), "chunk_count": d["chunks"]}
+            for d in doc_set.values()
+        ]
+        docs.sort(key=lambda x: x["doc_id"])  # 稳定排序
+        logger.info(f"列出文档: {len(docs)} 个 PDF, chunks_without_doc_id={chunks_without_doc_id}, total_chunks={len(rag_index.chunks)}, doc_ids={[d['doc_id'] for d in docs]}")
+        return {"docs": docs}
+    except Exception as e:
+        logger.error(f"列出文档失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="内部错误")
 
 
 @app.get("/pdf")
@@ -357,39 +459,57 @@ def _generate_answer_stream(question: str, sources: List[Dict], session_id: str)
     # 使用 non_blocking=True 加速数据传输
     inputs = {k: v.to(model_device, non_blocking=True) for k, v in inputs.items()}
     
-    # 创建流式迭代器（不跳过特殊token，保留think内容）
-    streamer = TextIteratorStreamer(
-        llm_tokenizer,
-        skip_prompt=True,
-        skip_special_tokens=False,  # 保留think标记
-        timeout=300.0
+    # 同步生成（避免 TextIteratorStreamer 在 MPS 上卡死）
+    logger.info(
+        "[generate_stream] start | device=%s input_tokens=%s", 
+        llm_model.device if hasattr(llm_model, 'device') else 'unknown',
+        inputs['input_ids'].shape if 'input_ids' in inputs else 'n/a'
     )
     
-    # 定义生成函数（在后台线程中运行，使用 inference_mode）
-    def generate_with_inference_mode():
-        with torch.inference_mode():  # 使用 inference_mode 比 no_grad 更快
-            llm_model.generate(
-                **inputs,
-                max_new_tokens=2048,  # 增加生成长度上限，让模型完整回答
-                do_sample=False,
-                use_cache=True,
-                pad_token_id=llm_tokenizer.eos_token_id,
-                eos_token_id=llm_tokenizer.eos_token_id,
-                repetition_penalty=1.1,
-                num_beams=1,
-                early_stopping=True,  # 遇到 EOS 自动停止
-                streamer=streamer,
-            )
-    
-    thread = Thread(target=generate_with_inference_mode)
-    thread.start()
-    
-    # 流式输出token
     generated_text = ""
     try:
-        for new_text in streamer:
-            generated_text += new_text
-            yield f"data: {json.dumps({'type': 'token', 'token': new_text, 'text': generated_text}, ensure_ascii=False)}\n\n"
+        # 使用 TextIteratorStreamer 实现真正的流式输出
+        streamer = TextIteratorStreamer(
+            llm_tokenizer, 
+            skip_special_tokens=False,
+            skip_prompt=True
+        )
+        
+        gen_kwargs = {
+            "max_new_tokens": 2048,
+            "do_sample": False,
+            "use_cache": True,
+            "pad_token_id": llm_tokenizer.eos_token_id,
+            "eos_token_id": llm_tokenizer.eos_token_id,
+            "repetition_penalty": 1.1,
+            "num_beams": 1,
+            "early_stopping": True,
+            "streamer": streamer,
+        }
+        
+        # 在线程中运行生成，避免阻塞
+        with torch.inference_mode():
+            gen_thread = Thread(
+                target=llm_model.generate,
+                kwargs={**inputs, **gen_kwargs}
+            )
+            gen_thread.daemon = True
+            gen_thread.start()
+            
+            logger.info("[generate_stream] generation thread started")
+            
+            # 流式输出 token
+            accumulated = ""
+            for text in streamer:
+                generated_text += text
+                accumulated += text
+                # 按照实际生成的文本发送
+                yield f"data: {json.dumps({'type': 'token', 'token': text, 'text': accumulated}, ensure_ascii=False)}\n\n"
+                # logger.info(f"[generate_stream] token: {repr(text)}")
+            
+            # 等待生成线程完成
+            gen_thread.join(timeout=60)
+            logger.info(f"[generate_stream] generation done, text_length={len(generated_text)}")
         
         # 保存模型回答到session
         _save_message_to_session(session_id, "model", generated_text, sources)
@@ -397,13 +517,18 @@ def _generate_answer_stream(question: str, sources: List[Dict], session_id: str)
         # 发送完成信号
         yield f"data: {json.dumps({'type': 'done', 'full_text': generated_text, 'session_id': session_id}, ensure_ascii=False)}\n\n"
     except Exception as e:
-        logger.error(f"流式生成错误: {e}")
+        logger.error(f"[generate_stream] error: {e}", exc_info=True)
         yield f"data: {json.dumps({'type': 'error', 'error': str(e)}, ensure_ascii=False)}\n\n"
-    finally:
-        thread.join(timeout=5)
         # 清理缓存
-        if device == "musa" and hasattr(torch.musa, 'empty_cache'):
-            torch.musa.empty_cache()
+        if device == "musa":
+            try:
+                import torch_musa  # type: ignore
+                if hasattr(torch_musa, 'empty_cache'):
+                    torch_musa.empty_cache()
+            except Exception:
+                pass
+        elif device == "cuda" and hasattr(torch.cuda, 'empty_cache'):
+            torch.cuda.empty_cache()
 
 
 @app.post("/ask/stream")
@@ -425,10 +550,15 @@ async def ask_stream(request: AskRequest):
         expanded_query = _expand_query(request.question, session_id)
         
         # 搜索相关 chunks
-        search_results = rag_index.search(expanded_query, top_k=8)
+        search_results = rag_index.search(expanded_query, top_k=8, doc_id=request.doc_id)
         
         # 按页面聚合
         sources = rag_index.aggregate_by_page(search_results, max_sources=4)
+        
+        # 调试：打印搜出来的 source
+        for i, src in enumerate(sources):
+            logger.info(f"Source {i}: page={src.get('pdf_page')}, snippet_len={len(src.get('snippet', ''))}")
+            logger.debug(f"  snippet: {src.get('snippet', '')[:200]}")
         
         logger.info(f"检索完成，找到 {len(sources)} 个sources")
         
@@ -481,7 +611,7 @@ async def ask(request: AskRequest):
         expanded_query = _expand_query(request.question, session_id)
         
         # 搜索相关 chunks
-        search_results = rag_index.search(expanded_query, top_k=8)
+        search_results = rag_index.search(expanded_query, top_k=8, doc_id=request.doc_id)
         
         # 按页面聚合
         sources = rag_index.aggregate_by_page(search_results, max_sources=4)
@@ -525,17 +655,28 @@ async def ask(request: AskRequest):
         generate_start_inner = time.time()
         
         with torch.inference_mode():  # 使用 inference_mode 比 no_grad 更快
-            outputs = llm_model.generate(
-                **inputs,
-                do_sample=False,
-                max_new_tokens=2048,  # 增加生成长度上限，让模型完整回答
-                use_cache=True,
-                pad_token_id=llm_tokenizer.eos_token_id,
-                eos_token_id=llm_tokenizer.eos_token_id,
-                repetition_penalty=1.1,  # 防止重复
-                num_beams=1,  # 不使用beam search以加快速度
-                early_stopping=True,  # 遇到EOS立即停止，让模型自然结束
+            logger.info(
+                "[generate_sync] start | device=%s input_tokens=%s",
+                llm_model.device if hasattr(llm_model, 'device') else 'unknown',
+                inputs['input_ids'].shape if 'input_ids' in inputs else 'n/a'
             )
+            gen_kwargs = {
+                "do_sample": False,
+                "max_new_tokens": 512,  # 降低生成长度，避免 MPS 超时
+                "min_new_tokens": 1,
+                "pad_token_id": llm_tokenizer.eos_token_id,
+                "eos_token_id": llm_tokenizer.eos_token_id,
+                "repetition_penalty": 1.1,
+                "num_beams": 1,
+            }
+            if device != "mps":
+                gen_kwargs["use_cache"] = True
+            else:
+                logger.info("[generate_sync] MPS device: disabling use_cache")
+                gen_kwargs["use_cache"] = False
+            
+            outputs = llm_model.generate(**inputs, **gen_kwargs)
+            logger.info("[generate_sync] done | outputs_shape=%s", outputs.shape if outputs is not None else 'n/a')
         
         logger.info(f"生成完成，输出长度: {outputs.shape[1]}, 耗时: {(time.time() - generate_start_inner):.2f}秒")
         
@@ -546,8 +687,15 @@ async def ask(request: AskRequest):
         
         # 释放中间张量
         del outputs, generated_ids
-        if device == "musa" and hasattr(torch.musa, 'empty_cache'):
-            torch.musa.empty_cache()
+        if device == "musa":
+            try:
+                import torch_musa  # type: ignore
+                if hasattr(torch_musa, 'empty_cache'):
+                    torch_musa.empty_cache()
+            except Exception:
+                pass
+        elif device == "cuda" and hasattr(torch.cuda, 'empty_cache'):
+            torch.cuda.empty_cache()
         
         generate_ms = (time.time() - generate_start) * 1000
         

@@ -17,8 +17,11 @@ pip-delete-this-directory.txt
 .docker-cache
 
 .hf_cache
-
+.modelscope_cache
 rag_store
 node_modules
 .next
 models
+.DS_Store
+rag/statics
+.env
